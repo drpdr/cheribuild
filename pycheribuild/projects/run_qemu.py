@@ -35,7 +35,7 @@ import sys
 import typing
 from pathlib import Path
 
-from .build_qemu import BuildMorelloQEMU, BuildQEMU
+from .build_qemu import BuildBsdUserQEMU, BuildMorelloQEMU, BuildQEMU
 from .cherios import BuildCheriOS
 from .cross.cheribsd import BuildCHERIBSD, BuildCheriBsdMfsKernel, BuildFreeBSD, ConfigPlatform, KernelABI
 from .cross.freertos import BuildFreeRTOS
@@ -45,7 +45,7 @@ from .cross.u_boot import BuildUBoot
 from .disk_image import (BuildCheriBSDDiskImage, BuildDiskImageBase, BuildFreeBSDImage,
                          BuildFreeBSDWithDefaultOptionsDiskImage, BuildMinimalCheriBSDDiskImage)
 from .project import CheriConfig, CPUArchitecture, SimpleProject, TargetAliasWithDependencies
-from ..config.compilation_targets import CompilationTargets
+from ..config.compilation_targets import CompilationTargets, CrossCompileTarget
 from ..config.loader import ComputedDefaultValue
 from ..qemu_utils import qemu_supports_9pfs, QemuOptions, riscv_bios_arguments
 from ..targets import target_manager
@@ -299,7 +299,7 @@ class LaunchQEMUBase(SimpleProject):
             self._after_disk_options += ["-snapshot"]
 
         # input("Press enter to continue")
-        qemu_command = self.qemu_options.get_commandline(qemu_command=self.qemu_binary,
+        qemu_command = self.qemu_options.get_system_commandline(qemu_command=self.qemu_binary,
                                                          kernel_file=qemu_loader_or_kernel,
                                                          disk_image=self.disk_image,
                                                          disk_image_format=self.disk_image_format,
@@ -426,6 +426,41 @@ class LaunchQEMUBase(SimpleProject):
                 return True
         except OSError:
             return False
+
+
+class LaunchBsdUserQEMUBase(SimpleProject):
+    do_not_add_to_targets = True
+
+    @classmethod
+    def setup_config_options(cls, default_ssh_port: int = None, **kwargs):
+        super().setup_config_options(**kwargs)
+
+    def __init__(self, config: CheriConfig):
+        super().__init__(config)
+        self.qemu_binary = None  # type: typing.Optional[Path]
+        self.qemu_options = QemuOptions(self.crosscompile_target, is_system_mode=False)
+        self.rootfs_path = None  # type:typing.Optional[Path]
+
+    def setup(self):
+        super().setup()
+        xtarget = self.crosscompile_target
+        if xtarget.is_riscv(include_purecap=True):
+            self.qemu_binary = BuildBsdUserQEMU.qemu_cheri_binary(self)
+        else:
+            assert False, "Unknown target " + str(xtarget)
+
+    def process(self):
+        assert self.qemu_binary is not None
+        if not self.qemu_binary.exists():
+            self.dependency_error("QEMU is missing:", self.qemu_binary, cheribuild_target="qemu")
+
+        program = "{}{}".format(self.rootfs_path, "/bin/sh")
+        qemu_command = self.qemu_options.get_user_commandline(qemu_command=self.qemu_binary,
+                rootfs_path=self.rootfs_path, program=program)
+
+        self.info("About to run '{}' with the QEMU user mode".format(program))
+
+        self.run_cmd(qemu_command, stdout=sys.stdout, stderr=sys.stderr, give_tty_control=True)
 
 
 class AbstractLaunchFreeBSD(LaunchQEMUBase):
@@ -582,6 +617,28 @@ class LaunchCheriBSD(_RunMultiArchFreeBSDImage):
         xtarget = cls.get_crosscompile_target(config)
         if xtarget.is_hybrid_or_purecap_cheri([CPUArchitecture.RISCV64]):
             result.append("bbl-baremetal-riscv64-purecap")
+        return result
+
+
+class LaunchCheriBSDShell(LaunchBsdUserQEMUBase):
+    target = "run"
+    _source_class = BuildCHERIBSD
+    _freebsd_class = BuildCHERIBSD
+    _always_add_suffixed_targets = True
+    supported_architectures = [CompilationTargets.CHERIBSD_RISCV_PURECAP]
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.rootfs_path = self._source_class.get_rootfs_dir(self, config=config)
+
+    @staticmethod
+    def custom_target_name(base_target: str, xtarget: CrossCompileTarget) -> str:
+        return base_target + '-' + xtarget.generic_target_suffix + '-shell'
+
+    @classmethod
+    def dependencies(cls: "typing.Type[_RunMultiArchFreeBSDImage]", config: CheriConfig) -> "list[str]":
+        xtarget = cls.get_crosscompile_target(config)
+        result = ["bsd-user-qemu", cls._source_class.get_class_for_target(xtarget).target]
         return result
 
 
